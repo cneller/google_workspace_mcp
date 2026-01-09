@@ -4,27 +4,26 @@ Google Gmail MCP Tools
 This module provides MCP tools for interacting with the Gmail API.
 """
 
-import logging
 import asyncio
 import base64
+import logging
 import ssl
-from html.parser import HTMLParser
-from typing import Optional, List, Dict, Literal, Any
-
 from email.mime.text import MIMEText
+from html.parser import HTMLParser
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import Body
 from pydantic import Field
 
-from auth.service_decorator import require_google_service
-from core.utils import handle_http_errors
-from core.server import server
 from auth.scopes import (
-    GMAIL_SEND_SCOPE,
     GMAIL_COMPOSE_SCOPE,
-    GMAIL_MODIFY_SCOPE,
     GMAIL_LABELS_SCOPE,
+    GMAIL_MODIFY_SCOPE,
+    GMAIL_SEND_SCOPE,
 )
+from auth.service_decorator import require_google_service
+from core.server import server
+from core.utils import handle_http_errors
 
 logger = logging.getLogger(__name__)
 
@@ -307,6 +306,168 @@ def _generate_gmail_web_url(item_id: str, account_index: int = 0) -> str:
     return f"https://mail.google.com/mail/u/{account_index}/#all/{item_id}"
 
 
+def _format_labels(label_ids: List[str]) -> str:
+    """
+    Format Gmail label IDs into a human-readable string.
+    Separates system labels from user labels for clarity.
+
+    Args:
+        label_ids: List of Gmail label IDs
+
+    Returns:
+        Formatted string of labels
+    """
+    if not label_ids:
+        return "(none)"
+
+    # Common system labels to display nicely
+    system_label_display = {
+        "INBOX": "INBOX",
+        "UNREAD": "UNREAD",
+        "STARRED": "STARRED",
+        "IMPORTANT": "IMPORTANT",
+        "SENT": "SENT",
+        "DRAFT": "DRAFT",
+        "SPAM": "SPAM",
+        "TRASH": "TRASH",
+        "CATEGORY_PERSONAL": "Personal",
+        "CATEGORY_SOCIAL": "Social",
+        "CATEGORY_PROMOTIONS": "Promotions",
+        "CATEGORY_UPDATES": "Updates",
+        "CATEGORY_FORUMS": "Forums",
+    }
+
+    system_labels = []
+    user_labels = []
+
+    for label_id in label_ids:
+        if label_id in system_label_display:
+            system_labels.append(system_label_display[label_id])
+        elif label_id.startswith("CATEGORY_"):
+            # Other category labels
+            system_labels.append(label_id.replace("CATEGORY_", "").title())
+        elif label_id.startswith("Label_"):
+            # User labels have IDs like "Label_123" - just show the ID
+            # In a full implementation, we'd resolve these to names
+            user_labels.append(f"[{label_id}]")
+        else:
+            # Unknown labels
+            user_labels.append(label_id)
+
+    all_labels = system_labels + user_labels
+    return ", ".join(all_labels) if all_labels else "(none)"
+
+
+def _has_attachments(payload: dict) -> bool:
+    """
+    Check if a message has attachments.
+
+    Args:
+        payload: The message payload from Gmail API
+
+    Returns:
+        True if the message has attachments, False otherwise
+    """
+
+    def check_parts(part: dict) -> bool:
+        # Check if this part is an attachment
+        if part.get("filename") and part.get("body", {}).get("attachmentId"):
+            return True
+        # Recursively check sub-parts
+        if "parts" in part:
+            for subpart in part["parts"]:
+                if check_parts(subpart):
+                    return True
+        return False
+
+    return check_parts(payload)
+
+
+def _format_gmail_search_with_metadata(
+    messages_with_metadata: List[Dict[str, Any]],
+    query: str,
+    next_page_token: Optional[str] = None,
+) -> str:
+    """
+    Format Gmail search results with full metadata in triage-optimized format.
+
+    Args:
+        messages_with_metadata: List of message dicts with full metadata from messages.get
+        query: The original search query
+        next_page_token: Pagination token if more results available
+
+    Returns:
+        Formatted string with rich message details for email triage
+    """
+    if not messages_with_metadata:
+        return f"No messages found for query: '{query}'"
+
+    lines = [
+        f"Found {len(messages_with_metadata)} messages matching '{query}':",
+        "",
+    ]
+
+    for i, message in enumerate(messages_with_metadata, 1):
+        if not message or not isinstance(message, dict):
+            lines.append(f"{i}. [Error: Invalid message data]\n")
+            continue
+
+        # Check if this is an error entry
+        if "error" in message:
+            lines.append(f"{i}. [Error: {message['error']}]\n")
+            continue
+
+        message_id = message.get("id", "unknown")
+        thread_id = message.get("threadId", "unknown")
+        payload = message.get("payload", {})
+
+        # Extract headers
+        headers = _extract_headers(payload, GMAIL_METADATA_HEADERS)
+        subject = headers.get("Subject", "(no subject)")
+        sender = headers.get("From", "(unknown sender)")
+        date = headers.get("Date", "(unknown date)")
+
+        # Extract triage-critical fields
+        snippet = message.get("snippet", "")
+        label_ids = message.get("labelIds", [])
+        has_attachments = _has_attachments(payload)
+
+        # Format labels with UNREAD indicator prominently
+        is_unread = "UNREAD" in label_ids
+        status_indicator = "[UNREAD] " if is_unread else ""
+
+        lines.append(f"{i}. {status_indicator}Subject: {subject}")
+        lines.append(f"   From: {sender}")
+        lines.append(f"   Date: {date}")
+        if snippet:
+            # Truncate long snippets for display
+            display_snippet = snippet[:150] + "..." if len(snippet) > 150 else snippet
+            lines.append(f"   Preview: {display_snippet}")
+        lines.append(f"   Labels: {_format_labels(label_ids)}")
+        lines.append(f"   Attachments: {'Yes' if has_attachments else 'No'}")
+        lines.append(f"   Message ID: {message_id} | Thread ID: {thread_id}")
+        lines.append(f"   Web Link: {_generate_gmail_web_url(message_id)}")
+        lines.append("")
+
+    # Add usage hints
+    lines.extend(
+        [
+            "💡 NEXT STEPS:",
+            "  • To read full content: get_gmail_messages_content_batch(message_ids=[...], format='full')",
+            "  • To read threads: get_gmail_thread_content(thread_id='...')",
+        ]
+    )
+
+    # Add pagination info if there's a next page
+    if next_page_token:
+        lines.append("")
+        lines.append(
+            f"📄 MORE RESULTS: Call search_gmail_messages(..., page_token='{next_page_token}', include_metadata=True)"
+        )
+
+    return "\n".join(lines)
+
+
 def _format_gmail_results_plain(
     messages: list, query: str, next_page_token: Optional[str] = None
 ) -> str:
@@ -390,24 +551,33 @@ async def search_gmail_messages(
     user_google_email: str,
     page_size: int = 10,
     page_token: Optional[str] = None,
+    include_metadata: bool = False,
 ) -> str:
     """
     Searches messages in a user's Gmail account based on a query.
-    Returns both Message IDs and Thread IDs for each found message, along with Gmail web interface links for manual verification.
-    Supports pagination via page_token parameter.
 
     Args:
-        query (str): The search query. Supports standard Gmail search operators.
+        query (str): The search query. Supports standard Gmail search operators
+            (e.g., "is:unread", "from:alice@example.com", "newer_than:7d").
         user_google_email (str): The user's Google email address. Required.
-        page_size (int): The maximum number of messages to return. Defaults to 10.
-        page_token (Optional[str]): Token for retrieving the next page of results. Use the next_page_token from a previous response.
+        page_size (int): The maximum number of messages to return. Defaults to 10, max 50.
+        page_token (Optional[str]): Token for retrieving the next page of results.
+        include_metadata (bool): If True, fetches full metadata for each message including:
+            - Subject, From, Date headers
+            - Preview snippet (first ~100 chars of body)
+            - Labels (INBOX, UNREAD, IMPORTANT, etc.)
+            - Attachment indicator
+            This enables email triage in a single call. Defaults to False.
 
     Returns:
-        str: LLM-friendly structured results with Message IDs, Thread IDs, and clickable Gmail web interface URLs for each found message.
-        Includes pagination token if more results are available.
+        str: When include_metadata=False: Message IDs, Thread IDs, and web links.
+             When include_metadata=True: Rich triage-ready output with subject, sender,
+             date, preview, labels, and attachment status for each message.
+             Includes pagination token if more results are available.
     """
     logger.info(
-        f"[search_gmail_messages] Email: '{user_google_email}', Query: '{query}', Page size: {page_size}"
+        f"[search_gmail_messages] Email: '{user_google_email}', Query: '{query}', "
+        f"Page size: {page_size}, Include metadata: {include_metadata}"
     )
 
     # Build the API request parameters
@@ -435,14 +605,89 @@ async def search_gmail_messages(
     # Extract next page token for pagination
     next_page_token = response.get("nextPageToken")
 
-    formatted_output = _format_gmail_results_plain(messages, query, next_page_token)
-
     logger.info(f"[search_gmail_messages] Found {len(messages)} messages")
     if next_page_token:
         logger.info(
             "[search_gmail_messages] More results available (next_page_token present)"
         )
-    return formatted_output
+
+    # If include_metadata is False, return simple ID-based results
+    if not include_metadata:
+        return _format_gmail_results_plain(messages, query, next_page_token)
+
+    # Fetch metadata for all messages in a batch
+    if not messages:
+        return f"No messages found for query: '{query}'"
+
+    logger.info(
+        f"[search_gmail_messages] Fetching metadata for {len(messages)} messages"
+    )
+
+    message_ids = [msg.get("id") for msg in messages if msg.get("id")]
+    messages_with_metadata: List[Dict[str, Any]] = []
+
+    # Use batch API to fetch metadata efficiently
+    results: Dict[str, Dict] = {}
+
+    def _batch_callback(request_id: str, response: Any, exception: Any) -> None:
+        results[request_id] = {"data": response, "error": exception}
+
+    try:
+        batch = service.new_batch_http_request(callback=_batch_callback)
+
+        for mid in message_ids:
+            req = (
+                service.users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=mid,
+                    format="metadata",
+                    metadataHeaders=GMAIL_METADATA_HEADERS,
+                )
+            )
+            batch.add(req, request_id=mid)
+
+        await asyncio.to_thread(batch.execute)
+
+        # Collect results in order
+        for mid in message_ids:
+            entry = results.get(mid, {"data": None, "error": "No result"})
+            if entry["error"]:
+                messages_with_metadata.append({"id": mid, "error": str(entry["error"])})
+            elif entry["data"]:
+                messages_with_metadata.append(entry["data"])
+            else:
+                messages_with_metadata.append({"id": mid, "error": "No data returned"})
+
+    except Exception as batch_error:
+        # Fallback to sequential fetching if batch fails
+        logger.warning(
+            f"[search_gmail_messages] Batch API failed, falling back to sequential: {batch_error}"
+        )
+
+        for mid in message_ids:
+            try:
+                msg = await asyncio.to_thread(
+                    service.users()
+                    .messages()
+                    .get(
+                        userId="me",
+                        id=mid,
+                        format="metadata",
+                        metadataHeaders=GMAIL_METADATA_HEADERS,
+                    )
+                    .execute
+                )
+                messages_with_metadata.append(msg)
+            except Exception as e:
+                messages_with_metadata.append({"id": mid, "error": str(e)})
+            # Small delay to prevent connection exhaustion
+            await asyncio.sleep(GMAIL_REQUEST_DELAY)
+
+    return _format_gmail_search_with_metadata(
+        messages_with_metadata, query, next_page_token
+    )
 
 
 @server.tool()
@@ -454,14 +699,19 @@ async def get_gmail_message_content(
     service, message_id: str, user_google_email: str
 ) -> str:
     """
-    Retrieves the full content (subject, sender, recipients, plain text body) of a specific Gmail message.
+    Retrieves the full content of a specific Gmail message.
 
     Args:
         message_id (str): The unique ID of the Gmail message to retrieve.
         user_google_email (str): The user's Google email address. Required.
 
     Returns:
-        str: The message details including subject, sender, date, Message-ID, recipients (To, Cc), and body content.
+        str: The message details including:
+            - Subject, From, Date, Message-ID
+            - Recipients (To, Cc)
+            - Labels (INBOX, UNREAD, IMPORTANT, custom labels, etc.)
+            - Full body content (plain text with HTML fallback)
+            - Attachment metadata with download instructions
     """
     logger.info(
         f"[get_gmail_message_content] Invoked. Message ID: '{message_id}', Email: '{user_google_email}'"
@@ -515,6 +765,9 @@ async def get_gmail_message_content(
     # Extract attachment metadata
     attachments = _extract_attachments(payload)
 
+    # Extract labels from full message response
+    label_ids = message_full.get("labelIds", [])
+
     content_lines = [
         f"Subject: {subject}",
         f"From:    {sender}",
@@ -528,6 +781,9 @@ async def get_gmail_message_content(
         content_lines.append(f"To:      {to}")
     if cc:
         content_lines.append(f"Cc:      {cc}")
+
+    # Add labels for context (INBOX, UNREAD, IMPORTANT, etc.)
+    content_lines.append(f"Labels:  {_format_labels(label_ids)}")
 
     content_lines.append(f"\n--- BODY ---\n{body_data or '[No text/plain body found]'}")
 
@@ -563,10 +819,18 @@ async def get_gmail_messages_content_batch(
     Args:
         message_ids (List[str]): List of Gmail message IDs to retrieve (max 25 per batch).
         user_google_email (str): The user's Google email address. Required.
-        format (Literal["full", "metadata"]): Message format. "full" includes body, "metadata" only headers.
+        format (Literal["full", "metadata"]): Message format:
+            - "metadata": Headers + preview snippet + labels + attachment indicator (ideal for triage)
+            - "full": Everything in metadata + complete body content
 
     Returns:
-        str: A formatted list of message contents including subject, sender, date, Message-ID, recipients (To, Cc), and body (if full format).
+        str: A formatted list of message contents. For metadata format includes:
+            - Subject, From, Date, Message-ID, To, Cc
+            - Preview snippet (first ~100 chars of body for quick scanning)
+            - Labels (INBOX, UNREAD, IMPORTANT, custom labels, etc.)
+            - Has Attachments indicator (Yes/No)
+            - Web link to Gmail
+        For full format, additionally includes the complete message body.
     """
     logger.info(
         f"[get_gmail_messages_content_batch] Invoked. Message count: {len(message_ids)}, Email: '{user_google_email}'"
@@ -689,6 +953,11 @@ async def get_gmail_messages_content_batch(
                     cc = headers.get("Cc", "")
                     rfc822_msg_id = headers.get("Message-ID", "")
 
+                    # Extract additional triage-critical fields from API response
+                    snippet = message.get("snippet", "")
+                    label_ids = message.get("labelIds", [])
+                    has_attachments = _has_attachments(payload)
+
                     msg_output = (
                         f"Message ID: {mid}\nSubject: {subject}\nFrom: {sender}\n"
                         f"Date: {headers.get('Date', '(unknown date)')}\n"
@@ -700,6 +969,19 @@ async def get_gmail_messages_content_batch(
                         msg_output += f"To: {to}\n"
                     if cc:
                         msg_output += f"Cc: {cc}\n"
+
+                    # Add snippet for quick preview (critical for email triage)
+                    if snippet:
+                        msg_output += f"Preview: {snippet}\n"
+
+                    # Add labels for context (INBOX, UNREAD, IMPORTANT, etc.)
+                    msg_output += f"Labels: {_format_labels(label_ids)}\n"
+
+                    # Add attachment indicator
+                    msg_output += (
+                        f"Has Attachments: {'Yes' if has_attachments else 'No'}\n"
+                    )
+
                     msg_output += f"Web Link: {_generate_gmail_web_url(mid)}\n"
 
                     output_messages.append(msg_output)
